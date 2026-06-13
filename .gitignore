@@ -3,3 +3,4 @@
 *.zip
 .terraform.lock.hcl
 __pycache__/
+*.tfvars
