@@ -1,113 +1,156 @@
 # Module 01 — Bedrock Spend Kill-Switch
 
-**The failure mode:** an agent loops, retries, or gets prompt-injected into burning inference. Bedrock has no built-in hard spend cap — AWS Budgets only *notifies* by default. By the time a human reads the email, you've spent the month's budget overnight.
+**Stop an AI agent from running up your AWS bill.**
 
-**The pattern:** turn the budget alert into an enforcement action. When Bedrock spend crosses a threshold (default **$300**), a Lambda attaches an explicit-deny policy to the agent's IAM role. Explicit deny beats every allow — the agent is cut off mid-loop, instantly.
+## The problem, in one minute
 
-## Architecture
+You give an AI agent access to Amazon Bedrock (AWS's service for running AI models). The agent gets stuck in a loop, retries forever, or someone tricks it with a malicious prompt. Either way, it keeps calling the model — and every call costs money.
+
+Here's the catch: **Bedrock has no built-in "stop at $X" button.** AWS Budgets can *email* you when you cross a limit, but an email doesn't stop anything. By the time you read it, the money's gone.
+
+## The fix
+
+This module turns that budget alert into an **automatic shut-off**. When Bedrock spend crosses a number you choose (default **$300/month**), it automatically blocks the agent from calling any more models. No human needs to be awake for it to work.
+
+It works because of one AWS rule: in IAM (AWS's permission system), **an explicit "deny" always wins over any "allow."** So the moment the deny is attached to the agent, it's cut off — instantly, mid-loop.
 
 ```mermaid
 flowchart LR
-    A[AWS Budgets\nBedrock spend > $300] --> B[SNS topic]
-    B --> C[Lambda: killswitch]
-    C -->|attach inline policy| D[Agent IAM role]
-    D -. "Deny bedrock:InvokeModel*" .-> E[Bedrock]
-    C --> F[SNS: ops alert\n'agent cut off']
+    A["💰 Budget hits your cap"] --> B["📣 SNS notification"]
+    B --> C["λ Lambda function"]
+    C -->|"attaches a DENY"| D["🤖 Agent's IAM role"]
+    D -. "🚫 can no longer call" .-> E["Bedrock"]
 ```
 
-## What gets deployed
+---
 
-| Resource | Purpose |
-|---|---|
-| `aws_budgets_budget` | Cost filter on Amazon Bedrock service, threshold notification at the cap |
-| `aws_sns_topic` | Budget alert fan-out |
-| `aws_lambda_function` | Attaches the deny policy to the target role; emits an ops alert |
-| `aws_iam_policy` (deny) | `Deny` on `bedrock:InvokeModel`, `bedrock:InvokeModelWithResponseStream`, `bedrock:Converse*` |
+## Before you start
 
-## Run it
+You need the AWS CLI and Terraform installed and logged in. See the [main README](../../README.md#what-youll-need-one-time-setup) if you haven't done that yet. You'll also need [`jq`](https://jqlang.github.io/jq/download/) for the test script (`brew install jq` on Mac).
+
+**Cost to run this whole module: about $0.** Budgets, SNS, and Lambda are all free tier. The test that makes one real model call costs less than a cent.
+
+---
+
+## Quick start (copy-paste)
+
+**Option A — you already have an AI agent with its own IAM role:**
 
 ```bash
-cd terraform
+git clone https://github.com/agentsec-aws/agentsec-aws
+cd agentsec-aws/modules/01-bedrock-spend-killswitch/terraform
+
 terraform init
-terraform apply -var="agent_role_name=YOUR_AGENT_ROLE" -var="monthly_cap_usd=300"
-# No agent yet? Use the built-in demo role instead:
+terraform apply -var="agent_role_name=YOUR_ROLE_NAME" -var="monthly_cap_usd=300"
+```
+
+Replace `YOUR_ROLE_NAME` with the name of the IAM role your agent uses, and set the dollar cap you want.
+
+**Option B — you just want to try it first (no agent needed):**
+
+```bash
+git clone https://github.com/agentsec-aws/agentsec-aws
+cd agentsec-aws/modules/01-bedrock-spend-killswitch/terraform
+
+terraform init
 terraform apply -var="create_demo_agent_role=true"
 ```
 
-## See it fire (without spending $300)
+This creates a safe throwaway role called `agentsec-demo-agent` so you can watch the whole thing work without touching anything real.
+
+When Terraform finishes it prints a few useful values (the deny policy, an alert topic, and the exact command to undo the block). Keep that output handy.
+
+---
+
+## See it actually fire (without spending $300)
+
+You don't want to spend $300 just to check your safety net works. This script proves it by sending the Lambda the *exact same signal* AWS Budgets would send for real:
 
 ```bash
-cd demo && ./run-demo.sh
+cd ../demo
+./run-demo.sh
 ```
 
-The script (1) calls Bedrock as the agent role — succeeds; (2) invokes the
-kill-switch Lambda with a synthetic SNS budget event; (3) repeats the same
-Bedrock call — `AccessDeniedException`. Requires `jq`. Cost: < $0.01.
-In regions that require inference profiles, override the model, e.g.
-`MODEL_ID=eu.anthropic.claude-haiku-4-5-20251001-v1:0 ./run-demo.sh`.
+What you'll see:
 
-**Cost to run this demo:** ~$0. Budgets (first two free), SNS, and Lambda are all inside the free tier. The demo script that triggers a real Bedrock call costs < $0.01.
+```text
+==> 1/3 Bedrock call as agent role 'my-agent-role'
+OK                                              ← agent works normally
 
-**Teardown:** `terraform destroy` (also detaches the deny policy if it fired).
+==> 2/3 Budget alert fires the kill-switch
+{"status": "agent disabled"}                    ← the shut-off triggers
 
-## Example session
-
-Protecting a real agent role called `my-agent-role` with a $300 monthly cap:
-
-```bash
-$ cd terraform
-$ terraform init
-$ terraform apply -var="agent_role_name=my-agent-role" -var="monthly_cap_usd=300"
-...
-Apply complete! Resources: 10 added, 0 changed, 0 destroyed.
-
-Outputs:
-agent_role_name        = "my-agent-role"
-deny_policy_arn        = "arn:aws:iam::123456789012:policy/agentsec-bedrock-deny"
-killswitch_lambda_name = "agentsec-bedrock-killswitch"
-manual_reenable_command = "aws iam detach-role-policy --role-name my-agent-role --policy-arn arn:aws:iam::123456789012:policy/agentsec-bedrock-deny"
-ops_alert_topic_arn    = "arn:aws:sns:us-east-1:123456789012:agentsec-bedrock-killswitch-fired"
-```
-
-Get alerted when it fires (email, or point it at your Slack webhook):
-
-```bash
-$ aws sns subscribe \
-    --topic-arn arn:aws:sns:us-east-1:123456789012:agentsec-bedrock-killswitch-fired \
-    --protocol email --notification-endpoint you@example.com
-```
-
-Prove the cut-off without spending $300 (uses a synthetic budget event):
-
-```bash
-$ cd ../demo && ./run-demo.sh
-==> 1/3 Bedrock call as agent role 'my-agent-role' (should succeed)
-OK
-
-==> 2/3 Fake-firing the budget alert (synthetic SNS event -> kill-switch Lambda)
-{"status": "agent disabled", "role": "my-agent-role"}
-
-==> 3/3 Same Bedrock call again (should be DENIED)
-An error occurred (AccessDeniedException) when calling the Converse operation:
-User: arn:aws:sts::123456789012:assumed-role/my-agent-role/killswitch-demo
-is not authorized to perform: bedrock:InvokeModel ... with an explicit deny
-in an identity-based policy: arn:aws:iam::123456789012:policy/agentsec-bedrock-deny
-
+==> 3/3 Same call again
+AccessDeniedException: bedrock:InvokeModel       ← agent is now blocked 🎉
 ✅ Agent cut off. Kill-switch works.
 ```
 
-After investigating why spend spiked, restore access:
+> **Note on regions:** some AWS regions need a specific model ID. If the demo errors on the model, run it like this (Frankfurt example):
+> `MODEL_ID=eu.anthropic.claude-haiku-4-5-20251001-v1:0 ./run-demo.sh`
+
+---
+
+## Get notified when it fires
+
+So you actually hear about it, subscribe your email (or a Slack webhook) to the alert. Use the `ops_alert_topic_arn` value Terraform printed:
 
 ```bash
-$ aws iam detach-role-policy --role-name my-agent-role \
-    --policy-arn arn:aws:iam::123456789012:policy/agentsec-bedrock-deny
+aws sns subscribe \
+  --topic-arn <ops_alert_topic_arn from the terraform output> \
+  --protocol email --notification-endpoint you@example.com
 ```
 
-No agent role yet? `terraform apply -var="create_demo_agent_role=true"` creates a
-throwaway `agentsec-demo-agent` role so you can try the whole flow first.
+Confirm the email AWS sends you, and you're set.
 
-## Caveats (read before trusting your wallet to this)
+---
 
-- **Budgets latency:** AWS billing data lags ~8–12 hours. This is a backstop, not a real-time meter. For tighter control, pair with per-request token limits in the agent runtime.
-- The deny is attached to a **named role** — agents using other roles aren't covered. Module 02 covers consolidating agent identity.
-- Re-enabling is deliberately manual: detach the policy yourself once you know *why* spend spiked.
+## When it fires — what to do
+
+The block is **deliberately not automatic to undo.** If something burned your budget, you want a human to understand *why* before turning the agent back on.
+
+1. **Read the alert** — it tells you which role got cut off.
+2. **Find the cause** — check CloudWatch and your Bedrock logs. Was it a runaway loop? A prompt-injection attack? Or just real, legitimate demand?
+3. **Fix it** — patch the bug, or raise the cap if the spending was expected.
+4. **Re-enable** — run the `manual_reenable_command` Terraform gave you:
+
+```bash
+aws iam detach-role-policy --role-name YOUR_ROLE_NAME \
+  --policy-arn <deny_policy_arn from the terraform output>
+```
+
+---
+
+## Clean up
+
+Remove everything this created:
+
+```bash
+terraform destroy
+```
+
+This also lifts the block if it had fired.
+
+---
+
+## What gets created (for the curious)
+
+| Resource | What it's for |
+|---|---|
+| `aws_budgets_budget` | Watches your Bedrock spend and triggers at your cap |
+| `aws_sns_topic` | Carries the alert to the Lambda |
+| `aws_lambda_function` | Attaches the deny and sends you the heads-up |
+| `aws_iam_policy` (Deny) | The actual block — denies `bedrock:InvokeModel` and `Converse*` |
+
+One nice detail: the Lambda itself is locked down. Its permissions only let it attach *this one* deny policy to *one* role — so even if it were compromised, it can't do anything else.
+
+---
+
+## Honest limits (please read)
+
+This is a **safety net, not a real-time meter.** Know where it stops:
+
+- ⏱ **AWS billing data lags 8–12 hours.** This catches sustained overspend, not a single huge spike in the first minute. For tighter control, also cap tokens per request inside your agent.
+- 🎯 **It protects one named role.** Agents running as a different role aren't covered. (Module 02 will cover consolidating agent identity.)
+- 🔁 **The block doesn't lift itself** when the budget resets next month — that's on purpose. You re-enable manually.
+
+Anyone who tells you a single tool *completely* solves agent spend is skipping this section.
