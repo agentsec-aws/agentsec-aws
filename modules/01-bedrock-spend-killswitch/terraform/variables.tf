@@ -1,7 +1,7 @@
 variable "region" {
   description = "AWS region to deploy into."
   type        = string
-  default     = "us-east-1"
+  default     = "eu-central-1"
 }
 
 variable "agent_role_name" {
